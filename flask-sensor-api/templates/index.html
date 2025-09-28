@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Phone Sensors Test</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 2rem; }
+    h1 { margin-bottom: 0.5rem; }
+    .row { margin: 0.5rem 0; }
+    code { background: #f4f4f4; padding: 0.25rem 0.5rem; border-radius: 4px; }
+    .ok { color: #087f5b; }
+    .warn { color: #b08900; }
+    .err { color: #c92a2a; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+    button { padding: 0.5rem 1rem; }
+    pre { background: #fafafa; padding: 0.5rem; border-radius: 6px; overflow-x: auto; }
+  </style>
+</head>
+<body>
+  <h1>Phone Sensors Test</h1>
+  <p>Use this page on your phone (same Wi‑Fi as your laptop). It will collect gyroscope and location and POST to this server.</p>
+
+  <div class="card">
+    <h3>Permissions</h3>
+    <div class="row">Secure origin: <span id="secure-origin" class="warn">checking…</span></div>
+    <div class="row">Motion: <span id="perm-motion" class="warn">unknown</span></div>
+    <div class="row">Geolocation: <span id="perm-geo" class="warn">unknown</span></div>
+    <button id="btn-enable">Start capture (enable motion & prompt location)</button>
+    <p style="margin-top:.5rem; font-size:.9rem; color:#555;">
+      Tip: Geolocation may require HTTPS in Chrome. If it doesn’t prompt on this local IP, use an HTTPS tunnel (e.g., ngrok).
+    </p>
+  </div>
+
+  <div class="card">
+    <h3>Live Readings</h3>
+    <div class="row">Gyro (deg/s): <code id="gyro">{x:0, y:0, z:0}</code></div>
+    <div class="row">Accel (m/s²): <code id="accel">{x:0, y:0, z:0}</code></div>
+    <div class="row">Orientation (°): <code id="orient">{alpha:0, beta:0, gamma:0}</code></div>
+    <div class="row">Loc: <code id="loc">{lat:null, lng:null, acc:null}</code></div>
+    <div class="row">Events: gyro=<span id="cnt-gyro">0</span>, accel=<span id="cnt-accel">0</span>, orient=<span id="cnt-orient">0</span>, geo=<span id="cnt-geo">0</span></div>
+    <div class="row">Last event: gyro=<span id="ts-gyro">-</span>, accel=<span id="ts-accel">-</span>, orient=<span id="ts-orient">-</span>, geo=<span id="ts-geo">-</span></div>
+  </div>
+
+  <div class="card">
+    <h3>Pothole Detector</h3>
+    <div class="row">Detected count: <span id="cnt-pothole">0</span></div>
+    <div class="row">Last detected at: <span id="ts-pothole">-</span></div>
+  <div class="row">Thresholds (AND): gyroMag &gt; <code id="th-gyro">400</code> deg/s AND jerk &gt; <code id="th-jerk">40</code> m/s³ within <code id="th-window">300</code> ms</div>
+  <div class="row">Gyro deadzone per-axis: <code id="th-dead">3</code> deg/s</div>
+    <p style="margin-top:.25rem; font-size:.9rem; color:#555;">These are rough defaults; adjust as needed based on road tests.</p>
+  </div>
+
+  <div class="card">
+    <h3>POST Status</h3>
+    <div class="row">/sensor: <span id="status-sensor">-</span></div>
+    <pre id="resp-sensor"></pre>
+    <div class="row">/location: <span id="status-location">-</span></div>
+    <pre id="resp-location"></pre>
+  </div>
+
+  <script>
+  const secureOriginEl = document.getElementById('secure-origin');
+  const statusMotion = document.getElementById('perm-motion');
+    const statusGeo = document.getElementById('perm-geo');
+    const btnEnable = document.getElementById('btn-enable');
+    const gyroEl = document.getElementById('gyro');
+  const accelEl = document.getElementById('accel');
+  const orientEl = document.getElementById('orient');
+    const locEl = document.getElementById('loc');
+    const statusSensor = document.getElementById('status-sensor');
+    const statusLocation = document.getElementById('status-location');
+    const respSensor = document.getElementById('resp-sensor');
+    const respLocation = document.getElementById('resp-location');
+
+  let lastGyro = {x: 0, y: 0, z: 0};
+  let lastAccel = {x: 0, y: 0, z: 0};
+  let lastOrient = {alpha: 0, beta: 0, gamma: 0};
+  let lastLoc = {lat: null, lng: null, acc: null};
+  let capturing = false;
+  const cntGyro = document.getElementById('cnt-gyro');
+  const cntAccel = document.getElementById('cnt-accel');
+  const cntOrient = document.getElementById('cnt-orient');
+  const cntGeo = document.getElementById('cnt-geo');
+  const tsGyro = document.getElementById('ts-gyro');
+  const tsAccel = document.getElementById('ts-accel');
+  const tsOrient = document.getElementById('ts-orient');
+  const tsGeo = document.getElementById('ts-geo');
+  let cGyro=0, cAccel=0, cOrient=0, cGeo=0;
+  let potholeCount = 0; const cntPothole = document.getElementById('cnt-pothole'); const tsPothole = document.getElementById('ts-pothole');
+
+  // Heuristic thresholds (tweakable):
+  // - gyro magnitude spike (deg/s)
+  // - acceleration jerk magnitude (difference / dt) in m/s^3
+  let TH_GYRO = 400; // deg/s (further increased to reduce false positives)
+  let TH_JERK = 40;  // m/s^3 (further increased to reduce false positives)
+  let GYRO_DEADZONE = 3; // deg/s per axis: ignore tiny gyro fluctuations
+  let AND_WINDOW_MS = 300; // both conditions must occur within this window
+  // Allow overrides via URL params, e.g., ?gyro=300&jerk=30
+  (function applyThresholdOverrides(){
+    try {
+      const params = new URLSearchParams(location.search);
+      const g = parseFloat(params.get('gyro'));
+      if (!Number.isNaN(g) && g > 0) TH_GYRO = g;
+      const j = parseFloat(params.get('jerk'));
+      if (!Number.isNaN(j) && j > 0) TH_JERK = j;
+      const d = parseFloat(params.get('dead'));
+      if (!Number.isNaN(d) && d >= 0) GYRO_DEADZONE = d;
+      const w = parseFloat(params.get('win'));
+      if (!Number.isNaN(w) && w > 0) AND_WINDOW_MS = w;
+    } catch (_) {}
+    document.getElementById('th-gyro').textContent = TH_GYRO;
+    document.getElementById('th-jerk').textContent = TH_JERK;
+    document.getElementById('th-dead').textContent = GYRO_DEADZONE;
+    document.getElementById('th-window').textContent = AND_WINDOW_MS;
+  })();
+
+  // Keep previous accel sample to compute jerk
+  let prevAccel = null; let prevAccelTime = null;
+
+  function mag3(v){ return Math.sqrt((v.x||0)**2 + (v.y||0)**2 + (v.z||0)**2); }
+  function maybeReportPothole(metrics){
+    // Debounce: avoid spamming—require at least 2s since last detection
+    const now = Date.now();
+    if (maybeReportPothole.lastTs && (now - maybeReportPothole.lastTs) < 2000) return;
+    maybeReportPothole.lastTs = now;
+    potholeCount++; cntPothole.textContent = potholeCount; tsPothole.textContent = new Date().toLocaleTimeString();
+    // Send snapshot
+    fetch('/pothole', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ts: now,
+        location: lastLoc.lat != null ? lastLoc : null,
+        gyro: lastGyro,
+        accel: lastAccel,
+        orientation: lastOrient,
+        metrics
+      })
+    }).catch(()=>{});
+  }
+
+  // Secure context info
+  const isSecure = window.isSecureContext || location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+  secureOriginEl.textContent = isSecure ? 'secure' : 'not secure (HTTPS recommended for geolocation)';
+  secureOriginEl.className = isSecure ? 'ok' : 'warn';
+
+    // iOS requires explicit user gesture for motion permission
+    async function requestMotionPermission() {
+      try {
+        if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
+          const res = await DeviceMotionEvent.requestPermission();
+          statusMotion.textContent = res;
+          statusMotion.className = res === 'granted' ? 'ok' : 'err';
+        } else {
+          statusMotion.textContent = 'granted (not iOS)';
+          statusMotion.className = 'ok';
+        }
+      } catch (e) {
+        statusMotion.textContent = 'error';
+        statusMotion.className = 'err';
+        console.error(e);
+      }
+    }
+    
+    async function startCapture() {
+      // user gesture pathway
+      await requestMotionPermission();
+      capturing = true;
+      // Trigger a location prompt via getCurrentPosition once; then switch to watchPosition
+      if ('geolocation' in navigator) {
+        navigator.geolocation.getCurrentPosition((pos) => {
+          statusGeo.textContent = 'granted';
+          statusGeo.className = 'ok';
+          lastLoc = { lat: pos.coords.latitude, lng: pos.coords.longitude, acc: pos.coords.accuracy };
+          locEl.textContent = JSON.stringify(lastLoc);
+          // Begin watching after initial grant
+          navigator.geolocation.watchPosition((p) => {
+            lastLoc = { lat: p.coords.latitude, lng: p.coords.longitude, acc: p.coords.accuracy };
+            locEl.textContent = JSON.stringify(lastLoc);
+          }, (err) => {
+            statusGeo.textContent = err.message;
+            statusGeo.className = 'err';
+            console.warn(err);
+          }, { enableHighAccuracy: true, maximumAge: 2000, timeout: 10000 });
+        }, (err) => {
+          statusGeo.textContent = err.message;
+          statusGeo.className = 'err';
+          console.warn(err);
+        }, { enableHighAccuracy: true, timeout: 10000 });
+      } else {
+        statusGeo.textContent = 'not supported';
+        statusGeo.className = 'err';
+      }
+    }
+
+    btnEnable.addEventListener('click', startCapture);
+
+    // Device motion (gyroscope) handler
+  window.addEventListener('devicemotion', (event) => {
+      // Use rotationRate as gyro (deg/s)
+      const rr = event.rotationRate || {};
+      // Raw readings
+      const rawGyro = {
+        x: rr.beta || 0,  // rotation around X (pitch)
+        y: rr.gamma || 0, // rotation around Y (roll)
+        z: rr.alpha || 0  // rotation around Z (yaw)
+      };
+      // Apply per-axis deadzone to suppress tiny jitters
+      function dz(v){ return Math.abs(v) < GYRO_DEADZONE ? 0 : v; }
+      lastGyro = { x: dz(rawGyro.x), y: dz(rawGyro.y), z: dz(rawGyro.z) };
+      gyroEl.textContent = JSON.stringify(lastGyro);
+  cGyro++; cntGyro.textContent = cGyro; tsGyro.textContent = new Date().toLocaleTimeString();
+
+      // Acceleration (without gravity preferred fallback to including gravity)
+      const acc = event.acceleration || event.accelerationIncludingGravity || {};
+      lastAccel = {
+        x: acc.x || 0,
+        y: acc.y || 0,
+        z: acc.z || 0
+      };
+      accelEl.textContent = JSON.stringify(lastAccel);
+      cAccel++; cntAccel.textContent = cAccel; tsAccel.textContent = new Date().toLocaleTimeString();
+
+      // Heuristic detection
+  const gyroMag = mag3(lastGyro);
+  let jerkMag = 0;
+      const now = performance.now();
+      if (prevAccel && prevAccelTime){
+        const dt = (now - prevAccelTime)/1000; // seconds
+        if (dt > 0){
+          const dx = (lastAccel.x||0) - (prevAccel.x||0);
+          const dy = (lastAccel.y||0) - (prevAccel.y||0);
+          const dz = (lastAccel.z||0) - (prevAccel.z||0);
+          jerkMag = Math.sqrt(dx*dx + dy*dy + dz*dz) / dt; // m/s^3
+        }
+      }
+      prevAccel = { ...lastAccel }; prevAccelTime = now;
+
+      // AND logic with short window: record times when each condition is met
+      const tnow = performance.now();
+      if (gyroMag > TH_GYRO) window.__lastGyroHit = tnow;
+      if (jerkMag > TH_JERK) window.__lastJerkHit = tnow;
+      if (window.__lastGyroHit && window.__lastJerkHit && Math.abs(window.__lastGyroHit - window.__lastJerkHit) <= AND_WINDOW_MS){
+        maybeReportPothole({ gyroMag, jerkMag, TH_GYRO, TH_JERK, AND_WINDOW_MS, logic: 'AND' });
+        window.__lastGyroHit = undefined; window.__lastJerkHit = undefined;
+      }
+    });
+
+    // Orientation
+    window.addEventListener('deviceorientation', (e) => {
+      lastOrient = {
+        alpha: e.alpha || 0,
+        beta: e.beta || 0,
+        gamma: e.gamma || 0
+      };
+      orientEl.textContent = JSON.stringify(lastOrient);
+      cOrient++; cntOrient.textContent = cOrient; tsOrient.textContent = new Date().toLocaleTimeString();
+    });
+
+    // Some Android devices provide absolute orientation via this event
+    if ('ondeviceorientationabsolute' in window) {
+      window.addEventListener('deviceorientationabsolute', (e) => {
+        lastOrient = {
+          alpha: e.alpha ?? lastOrient.alpha,
+          beta: e.beta ?? lastOrient.beta,
+          gamma: e.gamma ?? lastOrient.gamma
+        };
+        orientEl.textContent = JSON.stringify(lastOrient);
+        cOrient++; cntOrient.textContent = cOrient; tsOrient.textContent = new Date().toLocaleTimeString();
+      });
+    }
+
+    // Note: geolocation watcher is set in startCapture() after initial prompt
+
+    // Periodically POST to server
+    async function postJSON(url, body, statusEl, respEl) {
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        const txt = await res.text();
+        statusEl.textContent = res.status + ' ' + res.statusText;
+        respEl.textContent = txt;
+      } catch (e) {
+        statusEl.textContent = 'ERR';
+        respEl.textContent = String(e);
+      }
+    }
+
+    setInterval(() => {
+      if (!capturing) return;
+      const ts = Date.now();
+      postJSON('/sensor', {
+        ts,
+        device: 'phone-web',
+        userAgent: navigator.userAgent,
+        gyro: lastGyro,
+        accel: lastAccel,
+        orientation: lastOrient
+      }, statusSensor, respSensor);
+      if (lastLoc.lat !== null) {
+        postJSON('/location', { ...lastLoc, ts }, statusLocation, respLocation);
+      }
+    }, 2000);
+  </script>
+</body>
+</html>
