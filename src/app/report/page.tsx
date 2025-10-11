@@ -1,9 +1,12 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Image from "next/image";
 import Link from "next/link";
+import dynamic from "next/dynamic";
+import "leaflet/dist/leaflet.css";
+import { icon } from "leaflet";
 
-// Add custom CSS for animations and slider
+// Add custom CSS for animations and slider (solid colors, no gradients)
 if (typeof document !== 'undefined') {
   const style = document.createElement('style');
   style.textContent = `
@@ -17,33 +20,48 @@ if (typeof document !== 'undefined') {
         transform: translateY(0);
       }
     }
+
     
+    
+    /* Minimal, classy slider styling */
+    .slider {
+      -webkit-appearance: none;
+      appearance: none;
+      height: 3px;
+      background: #e5e7eb; /* slate-200 */
+      border-radius: 9999px;
+    }
     .slider::-webkit-slider-thumb {
       appearance: none;
-      height: 24px;
-      width: 24px;
+      height: 18px;
+      width: 18px;
       border-radius: 50%;
-      background: linear-gradient(135deg, #3b82f6, #1d4ed8);
-      border: 3px solid white;
-      box-shadow: 0 4px 12px rgba(59, 130, 246, 0.4);
+      background: #2563eb; /* solid blue */
+      border: 2px solid #ffffff;
+      box-shadow: 0 1px 3px rgba(15, 23, 42, 0.15);
       cursor: pointer;
       transition: all 0.2s ease;
     }
     
     .slider::-webkit-slider-thumb:hover {
-      transform: scale(1.1);
-      box-shadow: 0 6px 20px rgba(59, 130, 246, 0.6);
+      transform: scale(1.05);
+      box-shadow: 0 2px 6px rgba(15, 23, 42, 0.2);
     }
     
     .slider::-moz-range-thumb {
-      height: 24px;
-      width: 24px;
+      height: 18px;
+      width: 18px;
       border-radius: 50%;
-      background: linear-gradient(135deg, #3b82f6, #1d4ed8);
-      border: 3px solid white;
-      box-shadow: 0 4px 12px rgba(59, 130, 246, 0.4);
+      background: #2563eb;
+      border: 2px solid #ffffff;
+      box-shadow: 0 1px 3px rgba(15, 23, 42, 0.15);
       cursor: pointer;
       transition: all 0.2s ease;
+    }
+    .slider::-moz-range-track {
+      height: 3px;
+      background: #e5e7eb;
+      border-radius: 9999px;
     }
   `;
   document.head.appendChild(style);
@@ -57,6 +75,7 @@ type Incident = {
   hardAvoid: boolean;
   note?: string;
   imageUrl?: string;
+  place?: string;
   createdAt: number;
 };
 
@@ -70,6 +89,67 @@ export default function ReportPage() {
   const [busy, setBusy] = useState(false);
   const [list, setList] = useState<Incident[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [place, setPlace] = useState<string>("");
+  const [geocoding, setGeocoding] = useState<boolean>(false);
+  const [search, setSearch] = useState("");
+  const [suggestions, setSuggestions] = useState<Array<{ id: string; name: string; place: string; center: { lat: number; lng: number } | null }>>([]);
+  const INDIA_CENTER: [number, number] = [22.351, 78.667];
+  const [mapCenter, setMapCenter] = useState<[number, number] | null>(null);
+  const [suppressSuggestions, setSuppressSuggestions] = useState<boolean>(false);
+  const [hoveringSuggestions, setHoveringSuggestions] = useState<boolean>(false);
+
+  // Leaflet dynamic imports (no SSR)
+  const MapContainer = useMemo(() => dynamic(() => import("react-leaflet").then(m => m.MapContainer), { ssr: false }), []);
+  const TileLayer = useMemo(() => dynamic(() => import("react-leaflet").then(m => m.TileLayer), { ssr: false }), []);
+  const Marker = useMemo(() => dynamic(() => import("react-leaflet").then(m => m.Marker), { ssr: false }), []);
+  const ClickPicker = useMemo(
+    () =>
+      dynamic(async () => {
+        const { useMapEvents } = await import("react-leaflet");
+        type ClickEvent = { latlng: { lat: number; lng: number } };
+        return function Picker() {
+          useMapEvents({
+            click(...args: unknown[]) {
+              const e = args[0] as ClickEvent;
+              const clat = e.latlng.lat;
+              const clng = e.latlng.lng;
+              if (typeof clat === "number" && typeof clng === "number") {
+                setLat(String(clat));
+                setLng(String(clng));
+                setMapCenter([clat, clng]);
+              }
+            },
+          });
+          return null;
+        };
+      }, { ssr: false }),
+    []
+  );
+  const FlyToCenter = useMemo(
+    () =>
+      dynamic(async () => {
+        const { useMap } = await import("react-leaflet");
+        return function Fly({ center, zoom }: { center: [number, number] | null; zoom?: number }) {
+          const map = useMap();
+          useEffect(() => {
+            if (center) {
+              try { map.flyTo(center, zoom ?? 16, { animate: true, duration: 0.8 }); } catch { map.setView(center, zoom ?? 16); }
+            }
+          }, [center, zoom, map]);
+          return null;
+        };
+      }, { ssr: false }),
+    []
+  );
+  const defaultIcon = useMemo(() => icon({
+    iconRetinaUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png",
+    iconUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png",
+    shadowUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png",
+    iconSize: [25, 41],
+    iconAnchor: [12, 41],
+    popupAnchor: [1, -34],
+    shadowSize: [41, 41],
+  }), []);
 
   async function refresh() {
     const r = await fetch("/api/incidents");
@@ -80,6 +160,54 @@ export default function ReportPage() {
   useEffect(() => {
     refresh();
   }, []);
+
+  // Reverse geocode when lat/lng change
+  useEffect(() => {
+    // Guard: avoid treating empty strings as 0,0 (ocean)
+    if (!lat || !lng || lat.trim() === "" || lng.trim() === "") {
+      setPlace("");
+      return;
+    }
+    const nlat = parseFloat(lat);
+    const nlng = parseFloat(lng);
+    if (!Number.isFinite(nlat) || !Number.isFinite(nlng)) {
+      setPlace("");
+      return;
+    }
+    const timer = setTimeout(async () => {
+      try {
+        setGeocoding(true);
+        const r = await fetch(`/api/geocode/reverse?lat=${encodeURIComponent(nlat)}&lng=${encodeURIComponent(nlng)}`);
+        const j = await r.json();
+        if (r.ok) setPlace(j.place || "");
+        setMapCenter([nlat, nlng]);
+      } catch {
+        // ignore
+      } finally {
+        setGeocoding(false);
+      }
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [lat, lng]);
+
+  // Search suggestions (debounced)
+  useEffect(() => {
+    if (suppressSuggestions) { return; }
+    if (!search || search.trim().length < 2) { setSuggestions([]); return; }
+    const t = setTimeout(async () => {
+      try {
+        const params = new URLSearchParams({ q: search, country: 'in' });
+        if (lat && lng && !Number.isNaN(Number(lat)) && !Number.isNaN(Number(lng))) {
+          params.set('lat', String(lat));
+          params.set('lng', String(lng));
+        }
+        const r = await fetch(`/api/geocode/search?${params.toString()}`);
+        const j = await r.json();
+        if (r.ok) setSuggestions(j.results || []);
+      } catch { /* ignore */ }
+    }, 300);
+    return () => clearTimeout(t);
+  }, [search, lat, lng, suppressSuggestions]);
 
   function useMyLocation() {
     if (!navigator.geolocation) {
@@ -130,6 +258,7 @@ export default function ReportPage() {
           severity,
           hardAvoid,
           note,
+          place: place || undefined,
           image: base64Image, // ✅ send as Base64
         }),
       });
@@ -145,19 +274,14 @@ export default function ReportPage() {
   }
 
   return (
-    <main className="relative min-h-screen w-full px-4 sm:px-6 py-8 text-black bg-gradient-to-br from-slate-50 via-blue-50/30 to-indigo-50/40">
-      {/* Animated background elements */}
-      <div className="fixed inset-0 overflow-hidden pointer-events-none">
-        <div className="absolute -top-40 -right-40 w-96 h-96 bg-blue-400/10 rounded-full blur-3xl animate-pulse"></div>
-        <div className="absolute -bottom-40 -left-40 w-96 h-96 bg-indigo-400/10 rounded-full blur-3xl animate-pulse delay-1000"></div>
-      </div>
+    <main className="relative min-h-screen w-full px-6 lg:px-10 py-8 text-black">
 
       {/* Top bar */}
-      <div className="mx-auto max-w-3xl flex items-center justify-between relative z-10">
-        <div className="text-xs uppercase tracking-[0.25em] text-zinc-900 font-medium">Safe Passage</div>
+      <div className="w-full flex items-center justify-between relative z-10 mb-8">
+        <div className="text-xs uppercase tracking-[0.25em] text-zinc-800 font-medium">Safe Passage</div>
         <Link 
           href="/" 
-          className="group px-4 py-2 rounded-xl text-sm bg-gradient-to-r from-blue-600 to-blue-700 text-white shadow-lg hover:shadow-xl hover:from-blue-700 hover:to-blue-800 transition-all duration-300 transform hover:scale-105"
+          className="px-4 py-2 rounded-lg text-sm bg-blue-600 text-white shadow-sm hover:bg-blue-700 transition-colors"
         >
           <span className="flex items-center gap-2">
             ← Back to map
@@ -165,44 +289,111 @@ export default function ReportPage() {
         </Link>
       </div>
 
-      {/* Form card */}
-      <form
-        onSubmit={submit}
-        className="mx-auto max-w-3xl mt-8 space-y-6 bg-white/40 backdrop-blur-xl rounded-2xl shadow-2xl border border-white/20 p-8 relative z-10 hover:shadow-3xl transition-shadow duration-500"
-      >
+      {/* Grid layout: Form (2/5) + Recent Reports (3/5) */}
+      <div className="w-full grid grid-cols-1 lg:grid-cols-5 gap-8 relative z-10">
+        {/* Form section - 2/5 width */}
+        <div className="lg:col-span-2">
+          <form
+            onSubmit={submit}
+            className="space-y-6 bg-white rounded-lg border border-slate-200 p-8 sticky top-8"
+          >
         {/* Lat + Lng */}
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
           <div className="group">
             <label className="block text-sm font-semibold mb-3 text-slate-700 group-focus-within:text-blue-600 transition-colors duration-200">Latitude</label>
             <div className="relative">
               <input
-                className="w-full rounded-xl px-4 py-3 text-sm bg-white/80 backdrop-blur-sm text-slate-900 placeholder-slate-400 border border-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-400 shadow-sm hover:shadow-md transition-all duration-300"
+                className="w-full rounded-lg px-4 py-3 text-sm bg-white text-slate-900 placeholder-slate-400 border border-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-400"
                 value={lat}
                 onChange={(e) => setLat(e.target.value)}
                 placeholder="28.6139"
               />
-              <div className="absolute inset-0 rounded-xl bg-gradient-to-r from-blue-500/5 to-transparent opacity-0 group-focus-within:opacity-100 transition-opacity duration-300 pointer-events-none"></div>
+              {/* focus overlay removed for mature style */}
             </div>
           </div>
           <div className="group">
             <label className="block text-sm font-semibold mb-3 text-slate-700 group-focus-within:text-blue-600 transition-colors duration-200">Longitude</label>
             <div className="relative">
               <input
-                className="w-full rounded-xl px-4 py-3 text-sm bg-white/80 backdrop-blur-sm text-slate-900 placeholder-slate-400 border border-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-400 shadow-sm hover:shadow-md transition-all duration-300"
+                className="w-full rounded-lg px-4 py-3 text-sm bg-white text-slate-900 placeholder-slate-400 border border-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-400"
                 value={lng}
                 onChange={(e) => setLng(e.target.value)}
                 placeholder="77.2090"
               />
-              <div className="absolute inset-0 rounded-xl bg-gradient-to-r from-blue-500/5 to-transparent opacity-0 group-focus-within:opacity-100 transition-opacity duration-300 pointer-events-none"></div>
+              {/* focus overlay removed for mature style */}
             </div>
           </div>
+        </div>
+        {/* Search and mini map picker */}
+        <div className="mt-2 grid grid-cols-1 gap-4">
+          <div className="relative">
+            <input
+              className="w-full rounded-lg px-4 py-3 text-sm bg-white text-slate-900 placeholder-slate-400 border border-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-400"
+              placeholder="Search a place, street, or area"
+              value={search}
+              onChange={(e) => { setSearch(e.target.value); setSuppressSuggestions(false); }}
+              onBlur={() => { setTimeout(() => { if (!hoveringSuggestions) { setSuggestions([]); setSuppressSuggestions(true); } }, 120); }}
+            />
+            {suggestions.length > 0 && !suppressSuggestions && (
+              <ul className="absolute z-50 left-0 bottom-full mb-2 w-full bg-white border border-slate-200 rounded-lg shadow-md max-h-56 overflow-auto" onMouseEnter={() => setHoveringSuggestions(true)} onMouseLeave={() => setHoveringSuggestions(false)}>
+                {suggestions.map(s => (
+                  <li key={s.id}>
+                    <button
+                      type="button"
+                      className="w-full text-left px-3 py-2 text-sm hover:bg-slate-50"
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        if (s.center) {
+                          setLat(String(s.center.lat));
+                          setLng(String(s.center.lng));
+                          setPlace(s.place);
+                          setMapCenter([s.center.lat, s.center.lng]);
+                        }
+                        setSearch(s.place);
+                        setSuggestions([]);
+                        setSuppressSuggestions(true);
+                      }}
+                    >
+                      <div className="font-medium text-slate-800">{s.name}</div>
+                      <div className="text-xs text-slate-500">{s.place}</div>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+          <div className={`h-56 w-full overflow-hidden rounded-lg border border-slate-200 relative`}>
+            {/* Mini map: click to choose location */}
+            <MapContainer center={mapCenter || INDIA_CENTER} zoom={mapCenter ? 13 : 5} style={{ height: "100%", width: "100%" }} zoomControl={false}>
+              <TileLayer
+                url={`https://api.mapbox.com/styles/v1/mapbox/streets-v12/tiles/256/{z}/{x}/{y}?access_token=${process.env.NEXT_PUBLIC_MAPBOX_ACCESS_TOKEN}`}
+                attribution='Map data © OpenStreetMap contributors, Imagery © Mapbox'
+              />
+              <FlyToCenter center={mapCenter} zoom={16} />
+              <ClickPicker />
+              {(lat && lng) && (
+                <Marker position={[Number(lat), Number(lng)]} icon={defaultIcon} />
+              )}
+            </MapContainer>
+          </div>
+        </div>
+        {/* Resolved place */}
+        <div className="-mt-2 mb-2 text-sm text-slate-700">
+          <span className="font-medium">Location: </span>
+          {geocoding ? (
+            <span className="text-slate-400">Resolving…</span>
+          ) : place ? (
+            <span className="text-slate-800">{place}</span>
+          ) : (
+            <span className="text-slate-400">Enter valid coordinates to resolve</span>
+          )}
         </div>
         <button
           type="button"
           onClick={useMyLocation}
-          className="group px-4 py-2.5 text-sm rounded-xl bg-gradient-to-r from-slate-200 to-slate-300 text-slate-700 hover:from-slate-300 hover:to-slate-400 shadow-md hover:shadow-lg transform hover:scale-105 transition-all duration-200 flex items-center gap-2"
+          className="px-4 py-2.5 text-sm rounded-lg bg-gray-200 text-slate-700 hover:bg-gray-300 transition-colors flex items-center gap-2"
         >
-          <svg className="w-4 h-4 group-hover:animate-pulse" fill="currentColor" viewBox="0 0 20 20">
+          <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
             <path fillRule="evenodd" d="M5.05 4.05a7 7 0 119.9 9.9L10 18.9l-4.95-4.95a7 7 0 010-9.9zM10 11a2 2 0 100-4 2 2 0 000 4z" clipRule="evenodd" />
           </svg>
           Use My Location
@@ -219,17 +410,10 @@ export default function ReportPage() {
                 max={100}
                 value={severity}
                 onChange={(e) => setSeverity(parseInt(e.target.value))}
-                className="w-full h-3 bg-gradient-to-r from-green-200 via-yellow-200 to-red-200 rounded-full appearance-none cursor-pointer slider"
-                style={{
-                  background: `linear-gradient(to right, #10b981 0%, #f59e0b ${severity/2}%, #ef4444 100%)`
-                }}
+                className="w-full appearance-none cursor-pointer slider"
               />
-              <div 
-                className="absolute top-1/2 transform -translate-y-1/2 w-6 h-6 bg-white rounded-full shadow-lg border-4 border-blue-500 transition-all duration-200 pointer-events-none"
-                style={{ left: `calc(${severity}% - 12px)` }}
-              ></div>
             </div>
-            <div className={`px-4 py-2 rounded-xl text-sm font-bold min-w-[80px] text-center shadow-md transition-all duration-300 ${
+            <div className={`px-4 py-2 rounded-lg text-sm font-bold min-w-[80px] text-center shadow-md transition-all duration-300 ${
               severity < 30 ? 'bg-green-100 text-green-800' :
               severity < 70 ? 'bg-yellow-100 text-yellow-800' :
               'bg-red-100 text-red-800'
@@ -245,7 +429,7 @@ export default function ReportPage() {
         </div>
 
         {/* Hard avoid */}
-        <div className="flex items-center gap-3 p-4 rounded-xl bg-slate-50/50 hover:bg-slate-100/50 transition-colors duration-200">
+  <div className="flex items-center gap-3 p-4 rounded-lg bg-slate-50 hover:bg-slate-100 transition-colors duration-200">
           <div className="relative">
             <input
               type="checkbox"
@@ -267,7 +451,7 @@ export default function ReportPage() {
           <label className="block text-sm font-semibold mb-3 text-slate-700 group-focus-within:text-blue-600 transition-colors duration-200">Additional Details</label>
           <div className="relative">
             <textarea
-              className="w-full rounded-xl px-4 py-3 text-sm bg-white/80 backdrop-blur-sm text-slate-900 placeholder-slate-400 border border-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-400 shadow-sm hover:shadow-md transition-all duration-300 resize-none"
+              className="w-full rounded-lg px-4 py-3 text-sm bg-white text-slate-900 placeholder-slate-400 border border-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-400 resize-none"
               rows={3}
               value={note}
               onChange={(e) => setNote(e.target.value)}
@@ -289,7 +473,7 @@ export default function ReportPage() {
               onChange={(e) => setImage(e.target.files?.[0] || null)}
               className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
             />
-            <div className="flex items-center justify-center w-full h-32 border-2 border-dashed border-slate-300 rounded-xl hover:border-blue-400 hover:bg-blue-50/50 transition-all duration-300 group-hover:scale-[1.02]">
+            <div className="flex items-center justify-center w-full h-32 border-2 border-dashed border-slate-300 rounded-lg hover:border-blue-400 hover:bg-blue-50 transition-colors">
               <div className="text-center">
                 <svg className="mx-auto h-8 w-8 text-slate-400 mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
@@ -305,38 +489,30 @@ export default function ReportPage() {
         <div className="pt-4">
           <button
             disabled={busy}
-            className="group relative w-full overflow-hidden rounded-2xl bg-gradient-to-r from-blue-600 to-blue-700 px-8 py-4 text-base font-semibold text-white shadow-xl hover:from-blue-700 hover:to-blue-800 hover:shadow-2xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 disabled:opacity-50 disabled:cursor-not-allowed transform hover:scale-[1.02] transition-all duration-300"
+            className="w-full overflow-hidden rounded-lg bg-blue-600 px-8 py-4 text-base font-semibold text-white shadow-sm hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500/40 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
           >
-            <div className={`flex items-center justify-center gap-3 transition-all duration-300 ${busy ? 'scale-95' : 'scale-100'}`}>
+            <div className="flex items-center justify-center gap-3">
               {busy && (
                 <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-white"></div>
               )}
               <span>{busy ? "Submitting Report..." : "Submit Incident Report"}</span>
-              {!busy && (
-                <svg className="w-5 h-5 transform group-hover:translate-x-1 transition-transform duration-200" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14 5l7 7m0 0l-7 7m7-7H3" />
-                </svg>
-              )}
             </div>
-            <div className="absolute inset-0 -top-[2px] bg-gradient-to-r from-white/0 via-white/40 to-white/0 transform translate-x-[-100%] group-hover:translate-x-[100%] transition-transform duration-700 ease-in-out"></div>
           </button>
         </div>
 
         {error && <p className="text-red-600 text-sm">{error}</p>}
-      </form>
-
-      {/* Recent Incidents */}
-      <section className="mx-auto max-w-3xl mt-12 relative z-10">
-        <div className="flex items-center gap-3 mb-6">
-          <div className="h-px flex-1 bg-gradient-to-r from-transparent via-slate-300 to-transparent"></div>
-          <h2 className="text-xl font-bold text-slate-800 tracking-tight">Recent Reports</h2>
-          <div className="h-px flex-1 bg-gradient-to-r from-transparent via-slate-300 to-transparent"></div>
+          </form>
         </div>
-        
-        <div className="bg-white/40 backdrop-blur-xl rounded-2xl shadow-2xl border border-white/20 p-6 hover:shadow-3xl transition-shadow duration-500">
+
+        {/* Recent Reports section - 3/5 width */}
+        <div className="lg:col-span-3">
+          <div className="bg-white rounded-lg border border-slate-200 p-8">
+            <div className="mb-6 border-b border-gray-200 pb-3">
+              <h2 className="text-xl font-semibold text-slate-800">Recent Reports</h2>
+            </div>
           {list.length === 0 ? (
             <div className="text-center py-12">
-              <div className="w-16 h-16 mx-auto mb-4 bg-gradient-to-br from-slate-200 to-slate-300 rounded-full flex items-center justify-center">
+              <div className="w-16 h-16 mx-auto mb-4 bg-slate-200 rounded-full flex items-center justify-center">
                 <svg className="w-8 h-8 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                 </svg>
@@ -346,21 +522,17 @@ export default function ReportPage() {
             </div>
           ) : (
             <ul className="space-y-4">
-              {list.map((i, index) => (
+              {list.map((i) => (
                 <li
                   key={i.id}
-                  className="group relative overflow-hidden rounded-xl bg-white/60 backdrop-blur-sm p-6 shadow-lg hover:shadow-xl border border-white/40 hover:bg-white/80 transition-all duration-300 hover:scale-[1.02]"
-                  style={{ 
-                    animationDelay: `${index * 100}ms`,
-                    animation: 'slideInUp 0.6s ease-out forwards'
-                  }}
+                  className="relative overflow-hidden rounded-none bg-white p-6 border-b border-slate-200 hover:bg-slate-50 transition-colors"
                 >
                   <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4">
                     <div className="flex-1">
                       <div className="flex items-center gap-3 mb-3">
                         <div className="flex items-center gap-2 text-sm font-semibold text-slate-800">
-                          <div className="w-2 h-2 bg-blue-500 rounded-full animate-pulse"></div>
-                          {i.lat.toFixed(5)}, {i.lng.toFixed(5)}
+                          <div className="w-2 h-2 flex-shrink-0 bg-rose-500 rounded-full"></div>
+                          {i.place ? i.place : `${i.lat.toFixed(5)}, ${i.lng.toFixed(5)}`}
                         </div>
                       </div>
                       
@@ -383,27 +555,14 @@ export default function ReportPage() {
                       </div>
                       
                       {i.note && (
-                        <p className="text-sm text-slate-700 leading-relaxed mb-3 bg-slate-50/50 rounded-lg p-3 border-l-4 border-blue-200">
+                        <p className="text-sm text-slate-800 leading-relaxed mb-3 bg-white rounded-lg p-3 italic">
                           &ldquo;{i.note}&rdquo;
                         </p>
                       )}
-                      
-                      {i.imageUrl && (
-                        <div className="mt-3 w-48 h-32 relative overflow-hidden rounded-lg shadow-md group-hover:shadow-lg transition-shadow duration-300">
-                          <Image
-                            src={i.imageUrl}
-                            alt="incident"
-                            fill
-                            className="object-cover group-hover:scale-105 transition-transform duration-300"
-                            sizes="192px"
-                          />
-                          <div className="absolute inset-0 bg-gradient-to-t from-black/20 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300"></div>
-                        </div>
-                      )}
                     </div>
                     
-                    <div className="text-right">
-                      <div className="text-xs text-slate-500 bg-slate-100/80 rounded-lg px-3 py-2">
+                    <div className="flex flex-col items-end gap-3 min-w-[14rem]">
+                      <div className="text-xs text-slate-500 bg-slate-100 rounded-md px-3 py-2">
                         {new Date(i.createdAt).toLocaleDateString('en-US', { 
                           month: 'short', 
                           day: 'numeric',
@@ -411,17 +570,41 @@ export default function ReportPage() {
                           minute: '2-digit'
                         })}
                       </div>
+                      {/* Static map preview on the right */}
+                      {(() => {
+                        const token = process.env.NEXT_PUBLIC_MAPBOX_ACCESS_TOKEN;
+                        if (!token) return null;
+                        const lat = i.lat;
+                        const lng = i.lng;
+                        const url = `https://api.mapbox.com/styles/v1/mapbox/streets-v12/static/pin-s+2563eb(${lng},${lat})/${lng},${lat},15,0/224x140@2x?access_token=${token}`;
+                        return (
+                          <div className="relative w-[224px] h-[140px] rounded-md overflow-hidden border border-slate-200">
+                            <Image src={url} alt="location map" fill sizes="224px" className="object-cover" />
+                          </div>
+                        );
+                      })()}
+                      {/* Uploaded image (if any) to the right too */}
+                      {i.imageUrl && (
+                        <div className="relative w-[224px] h-[140px] rounded-md overflow-hidden border border-slate-200">
+                          <Image
+                            src={i.imageUrl}
+                            alt="incident"
+                            fill
+                            className="object-cover"
+                            sizes="224px"
+                          />
+                        </div>
+                      )}
                     </div>
                   </div>
-                  
-                  {/* Subtle hover gradient */}
-                  <div className="absolute inset-0 bg-gradient-to-r from-blue-500/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300 pointer-events-none"></div>
                 </li>
               ))}
             </ul>
           )}
+          </div>
         </div>
-      </section>
+      </div>
     </main>
   );
 }
+``

@@ -9,6 +9,17 @@ declare module "react-leaflet" {
   export function useMapEvents(
     events: Record<string, (...args: unknown[]) => void>
   ): unknown;
+  export function useMap(): {
+    flyTo: (
+      center: [number, number] | { lat: number; lng: number },
+      zoom?: number,
+      options?: Record<string, unknown>
+    ) => void;
+    setView: (
+      center: [number, number] | { lat: number; lng: number },
+      zoom?: number
+    ) => void;
+  };
 }
 declare module "leaflet" {
   export type LatLngExpression = [number, number] | { lat: number; lng: number };

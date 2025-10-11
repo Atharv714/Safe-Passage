@@ -440,12 +440,12 @@ export default function Home() {
 
           {/* Safety advisory integrated */}
           {dangerOpen && (
-            <div className="rounded-xl border border-gray-700 bg-gray-800 p-3 shadow-md border-l-4 border-l-red-500">
+            <div className="rounded-xl bg-gray-200/20 backdrop-blur-2xl p-3 shadow-md">
               <div className="flex items-start gap-2">
                 <div className="mt-1 h-2 w-2 rounded-full bg-red-500" />
                 <div className="flex-1">
-                  <div className="font-semibold text-sm text-white">{dangerTitle}</div>
-                  <div className="text-xs text-gray-300 mt-1 whitespace-pre-line">{dangerText}</div>
+                  <div className="font-semibold text-sm text-rose-500">{dangerTitle}</div>
+                  <div className="text-xs text-gray-700 mt-1 whitespace-pre-line">{dangerText}</div>
                 </div>
                 <button className="ml-2 text-gray-400 hover:text-white" onClick={() => setDangerOpen(false)}>✕</button>
               </div>

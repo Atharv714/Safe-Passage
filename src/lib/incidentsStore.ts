@@ -5,6 +5,7 @@ export type Incident = {
   severity: number; // 0..100
   hardAvoid: boolean;
   note?: string;
+  place?: string;
   createdAt: number;
 };
 

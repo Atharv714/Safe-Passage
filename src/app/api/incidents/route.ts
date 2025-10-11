@@ -8,7 +8,7 @@ export async function GET() {
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { lat, lng, severity, hardAvoid, note } = body || {};
+  const { lat, lng, severity, hardAvoid, note, place } = body || {};
     if (
       typeof lat !== "number" ||
       typeof lng !== "number" ||
@@ -17,7 +17,7 @@ export async function POST(req: NextRequest) {
     ) {
       return new Response(JSON.stringify({ error: "Invalid body: lat,lng,severity,hardAvoid required" }), { status: 400 });
     }
-    const inc = addIncident({ lat, lng, severity, hardAvoid, note });
+  const inc = addIncident({ lat, lng, severity, hardAvoid, note, place });
     return Response.json(inc, { status: 201 });
   } catch {
     return new Response(JSON.stringify({ error: "Bad JSON" }), { status: 400 });
